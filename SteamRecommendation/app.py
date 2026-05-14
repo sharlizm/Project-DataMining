@@ -1,9 +1,16 @@
-# SteamVault — Steam Game Discovery & Recommendation Dashboard
+# SteamVault Pro - Steam Game Discovery & Hybrid Recommendation Dashboard
+# Put this file in the same folder as steam_top_games_2026.csv, or upload the CSV from the sidebar.
 
+from __future__ import annotations
+
+import html
+import io
 import math
 import re
+from collections import Counter
 from pathlib import Path
- 
+from typing import Iterable, Sequence
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -11,662 +18,1559 @@ import plotly.graph_objects as go
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
- 
-# ── Page config ───────────────────────────────────────────────────────────────
+
+try:
+    from scipy import sparse
+except Exception:  # pragma: no cover
+    sparse = None
+
+
+APP_TITLE = "SteamVault Pro"
+DEFAULT_CSV = Path(__file__).parent / "steam_top_games_2026.csv"
+
 st.set_page_config(
-    page_title="SteamVault",
-    page_icon="🎮",
+    page_title=APP_TITLE,
+    page_icon="SV",
     layout="wide",
     initial_sidebar_state="expanded",
 )
- 
-# FIX: path relatif terhadap lokasi file ini, bukan working directory
-CSV_PATH = Path(__file__).parent / "steam_top_games_2026.csv"
- 
-# ── CSS ───────────────────────────────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-    .stApp { background: linear-gradient(135deg, #0b0e14, #101826); color: #e2e8f0; }
-    .hero {
-        background: linear-gradient(135deg, rgba(26,159,255,.15), rgba(104,211,145,.06));
-        border: 1px solid rgba(99,179,237,.2);
-        border-radius: 20px; padding: 28px; margin-bottom: 20px;
-    }
-    .hero h1 { margin: 0; font-size: 3rem; color: #63b3ed; }
-    .hero p  { margin-top: 6px; color: #94a3b8; }
-    .game-card {
-        background: #161d2e; border: 1px solid rgba(99,179,237,.12);
-        border-radius: 16px; padding: 16px; margin-bottom: 14px;
-        display: flex; gap: 14px; align-items: flex-start;
-    }
-    .game-card img {
-        width: 120px; height: 56px; object-fit: cover;
-        border-radius: 8px; flex-shrink: 0;
-    }
-    .game-card-body { flex: 1; min-width: 0; }
-    .score-pill {
-        display: inline-block; padding: 4px 10px; border-radius: 999px;
-        background: #1a9fff; color: white; font-size: 12px; font-weight: 700;
-        margin-bottom: 8px;
-    }
-    .free-pill {
-        display: inline-block; padding: 4px 10px; border-radius: 999px;
-        background: #38a169; color: white; font-size: 12px; font-weight: 700;
-        margin-left: 6px;
-    }
-    .discount-pill {
-        display: inline-block; padding: 4px 10px; border-radius: 999px;
-        background: #e53e3e; color: white; font-size: 12px; font-weight: 700;
-        margin-left: 6px;
-    }
-    .tag-chip {
-        display: inline-block; padding: 3px 10px; border-radius: 999px;
-        background: rgba(99,179,237,.12); color: #63b3ed;
-        font-size: 12px; border: 1px solid rgba(99,179,237,.25);
-        margin: 2px 3px 2px 0; cursor: pointer; text-decoration: none;
-        transition: background .15s, color .15s;
-    }
-    .tag-chip:hover { background: rgba(99,179,237,.28); color: #90cdf4; }
-    .tag-chip.active { background: #1a9fff; color: white; border-color: #1a9fff; }
-    .tag-filter-bar {
-        background: #161d2e; border: 1px solid rgba(99,179,237,.15);
-        border-radius: 12px; padding: 12px 14px; margin-bottom: 14px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
- 
- 
-# ── Data loading ──────────────────────────────────────────────────────────────
-def parse_owners(s: str) -> float:
-    """Parse '1,000,000 .. 2,000,000' → mean in millions."""
-    if pd.isna(s) or not str(s).strip():
-        return np.nan
-    nums = [float(x.replace(",", "")) for x in re.findall(r"[\d,]+", str(s))]
-    return round(np.mean(nums) / 1_000_000, 2) if len(nums) >= 2 else np.nan
- 
- 
-@st.cache_data(ttl=3600)  # FIX: cache invalidation setelah 1 jam
-def load_steam(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        st.error(f"File CSV tidak ditemukan: {path}")
-        st.stop()
- 
-    df = pd.read_csv(path)
- 
-    # ── Tahun ─────────────────────────────────────────────────────────────────
-    df["year"] = (
-        df["release_date"].astype(str).str.extract(r"((?:19|20)\d{2})")[0].astype(float)
+
+
+# -----------------------------------------------------------------------------
+# Styling
+# -----------------------------------------------------------------------------
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --bg-0: #080b12;
+            --bg-1: #0d1320;
+            --bg-2: #121a2a;
+            --card: rgba(18, 26, 42, 0.92);
+            --card-2: rgba(22, 33, 54, 0.92);
+            --line: rgba(148, 163, 184, 0.18);
+            --line-2: rgba(56, 189, 248, 0.30);
+            --text: #e5eefb;
+            --muted: #94a3b8;
+            --soft: #cbd5e1;
+            --blue: #38bdf8;
+            --cyan: #22d3ee;
+            --green: #34d399;
+            --amber: #fbbf24;
+            --red: #fb7185;
+            --purple: #a78bfa;
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 32rem),
+                radial-gradient(circle at top right, rgba(167, 139, 250, 0.12), transparent 30rem),
+                linear-gradient(135deg, var(--bg-0), var(--bg-1));
+            color: var(--text);
+        }
+        .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
+        [data-testid="stSidebar"] {
+            background: rgba(8, 11, 18, 0.84);
+            border-right: 1px solid var(--line);
+        }
+        h1, h2, h3 { letter-spacing: -0.03em; }
+        div[data-testid="stMetric"] {
+            background: linear-gradient(180deg, rgba(18,26,42,0.95), rgba(13,19,32,0.95));
+            border: 1px solid var(--line);
+            border-radius: 1.2rem;
+            padding: 1rem 1rem;
+            box-shadow: 0 12px 36px rgba(0,0,0,0.22);
+        }
+        div[data-testid="stMetric"] label { color: var(--muted) !important; }
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: var(--text); }
+        .hero {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid var(--line-2);
+            border-radius: 28px;
+            padding: 30px;
+            margin: 0 0 18px 0;
+            background:
+                linear-gradient(135deg, rgba(56,189,248,0.16), rgba(167,139,250,0.10)),
+                linear-gradient(180deg, rgba(18,26,42,0.88), rgba(13,19,32,0.92));
+            box-shadow: 0 28px 90px rgba(0, 0, 0, 0.32);
+        }
+        .hero:after {
+            content: "";
+            position: absolute;
+            right: -120px;
+            top: -110px;
+            width: 300px;
+            height: 300px;
+            border-radius: 50%;
+            background: rgba(56,189,248,0.12);
+            filter: blur(2px);
+        }
+        .hero-kicker {
+            display: inline-flex;
+            gap: 8px;
+            align-items: center;
+            padding: 6px 11px;
+            border-radius: 999px;
+            background: rgba(56,189,248,0.12);
+            border: 1px solid rgba(56,189,248,0.24);
+            color: #bae6fd;
+            font-size: 0.82rem;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+        .hero h1 {
+            margin: 0;
+            font-size: clamp(2.2rem, 5vw, 4.5rem);
+            line-height: 0.96;
+        }
+        .hero p {
+            max-width: 820px;
+            color: var(--soft);
+            font-size: 1.05rem;
+            margin-top: 14px;
+            margin-bottom: 0;
+        }
+        .glass-panel {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            padding: 18px;
+            box-shadow: 0 18px 54px rgba(0,0,0,0.25);
+            margin-bottom: 16px;
+        }
+        .section-title {
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            gap: 12px;
+            margin: 10px 0 12px 0;
+        }
+        .section-title h3 { margin: 0; }
+        .muted { color: var(--muted); }
+        .game-card {
+            height: 100%;
+            background: linear-gradient(180deg, rgba(22,33,54,0.96), rgba(13,19,32,0.96));
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            overflow: hidden;
+            box-shadow: 0 18px 50px rgba(0,0,0,0.24);
+            transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+        }
+        .game-card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(56,189,248,0.45);
+            box-shadow: 0 24px 70px rgba(0,0,0,0.34);
+        }
+        .game-img-wrap {
+            width: 100%;
+            aspect-ratio: 2.16 / 1;
+            background: linear-gradient(135deg, rgba(56,189,248,0.16), rgba(167,139,250,0.11));
+            overflow: hidden;
+            border-bottom: 1px solid var(--line);
+        }
+        .game-img-wrap img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+        .game-body { padding: 14px 15px 16px 15px; }
+        .game-title {
+            font-size: 1.02rem;
+            font-weight: 800;
+            color: var(--text);
+            line-height: 1.25;
+            margin-bottom: 6px;
+        }
+        .game-title a { color: inherit; text-decoration: none; }
+        .meta-line {
+            color: var(--muted);
+            font-size: 0.82rem;
+            margin-bottom: 9px;
+        }
+        .pill-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            border-radius: 999px;
+            padding: 5px 9px;
+            font-size: 0.72rem;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+            border: 1px solid var(--line);
+            color: #dbeafe;
+            background: rgba(148,163,184,0.12);
+        }
+        .pill-blue { background: rgba(56,189,248,0.14); color: #bae6fd; border-color: rgba(56,189,248,0.28); }
+        .pill-green { background: rgba(52,211,153,0.14); color: #bbf7d0; border-color: rgba(52,211,153,0.28); }
+        .pill-amber { background: rgba(251,191,36,0.14); color: #fde68a; border-color: rgba(251,191,36,0.28); }
+        .pill-red { background: rgba(251,113,133,0.14); color: #fecdd3; border-color: rgba(251,113,133,0.28); }
+        .tag {
+            display: inline-flex;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: rgba(148,163,184,0.11);
+            border: 1px solid rgba(148,163,184,0.18);
+            color: #cbd5e1;
+            font-size: 0.72rem;
+            margin: 0 4px 5px 0;
+        }
+        .why {
+            border-top: 1px solid var(--line);
+            margin-top: 10px;
+            padding-top: 10px;
+            color: var(--soft);
+            font-size: 0.80rem;
+        }
+        .bar-row { margin: 7px 0; }
+        .bar-label {
+            display: flex;
+            justify-content: space-between;
+            color: var(--muted);
+            font-size: 0.72rem;
+            margin-bottom: 3px;
+        }
+        .bar-track {
+            height: 7px;
+            border-radius: 999px;
+            background: rgba(148,163,184,0.14);
+            overflow: hidden;
+        }
+        .bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--blue), var(--purple));
+        }
+        .mini-note {
+            border-left: 3px solid var(--blue);
+            background: rgba(56,189,248,0.08);
+            border-radius: 14px;
+            padding: 12px 14px;
+            color: var(--soft);
+            margin: 8px 0 16px 0;
+        }
+        .method-card {
+            background: rgba(18,26,42,0.92);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            padding: 16px;
+            height: 100%;
+        }
+        .method-card h4 { margin-top: 0; }
+        .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+        .stTabs [data-baseweb="tab"] {
+            background: rgba(148,163,184,0.08);
+            border: 1px solid rgba(148,163,184,0.14);
+            border-radius: 999px;
+            padding: 9px 15px;
+        }
+        .stTabs [aria-selected="true"] {
+            background: rgba(56,189,248,0.14) !important;
+            border-color: rgba(56,189,248,0.34) !important;
+            color: #bae6fd !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
- 
-    # ── Numerik ───────────────────────────────────────────────────────────────
+
+
+# -----------------------------------------------------------------------------
+# Data utilities
+# -----------------------------------------------------------------------------
+def clean_name(col: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
+
+
+def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [clean_name(c) for c in df.columns]
+    aliases = {
+        "app_id": ["appid", "steam_appid", "steam_id", "id"],
+        "name": ["title", "game", "game_name"],
+        "release_date": ["release", "date", "released", "release_year"],
+        "price_usd": ["price", "initial_price", "final_price", "price_dollar", "usd_price"],
+        "discount_pct": ["discount", "discount_percent", "discount_percentage"],
+        "metacritic_score": ["metacritic", "meta_score"],
+        "recommendations": ["recommendation_count", "recommendation", "reviews", "review_count"],
+        "positive_reviews": ["positive", "positive_review", "positive_ratings"],
+        "negative_reviews": ["negative", "negative_review", "negative_ratings"],
+        "avg_playtime_forever": ["average_playtime", "avg_playtime", "playtime_forever"],
+        "avg_playtime_2weeks": ["playtime_2weeks", "avg_2weeks"],
+        "median_playtime": ["median_playtime_forever"],
+        "peak_ccu": ["peak_players", "ccu", "concurrent_users"],
+        "required_age": ["age", "required_age_years"],
+        "dlc_count": ["dlcs", "dlc"],
+        "achievements": ["achievement_count"],
+        "genres": ["genre"],
+        "categories": ["category"],
+        "tags": ["tag", "steamspy_tags"],
+        "developer": ["developers"],
+        "publisher": ["publishers"],
+        "short_description": ["description", "about", "short_desc"],
+        "header_image": ["image", "thumbnail", "capsule_image", "cover"],
+        "estimated_owners": ["owners", "owner_range"],
+        "is_free": ["free", "free_to_play"],
+    }
+    for canonical, variants in aliases.items():
+        if canonical in df.columns:
+            continue
+        for variant in variants:
+            if variant in df.columns:
+                df = df.rename(columns={variant: canonical})
+                break
+    return df
+
+
+def split_tokens(value: object) -> list[str]:
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return []
+    text = re.sub(r"[\[\]\{\}\(\)'\"]", " ", text)
+    text = text.replace("/", ",")
+    parts = re.split(r"[,;|]+", text)
+    tokens = []
+    seen = set()
+    for part in parts:
+        token = re.sub(r"\s+", " ", part).strip()
+        if token and token.lower() not in seen and token.lower() not in {"nan", "none", "null"}:
+            tokens.append(token)
+            seen.add(token.lower())
+    return tokens
+
+
+def parse_owners(value: object) -> float:
+    if pd.isna(value):
+        return np.nan
+    nums = [float(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", str(value))]
+    if not nums:
+        return np.nan
+    return float(np.mean(nums) / 1_000_000)
+
+
+def to_number(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def to_bool(series: pd.Series) -> pd.Series:
+    true_values = {"true", "1", "yes", "y", "free", "f2p"}
+    false_values = {"false", "0", "no", "n", "paid", ""}
+
+    def _convert(x: object) -> bool:
+        if isinstance(x, bool):
+            return x
+        if pd.isna(x):
+            return False
+        val = str(x).strip().lower()
+        if val in true_values:
+            return True
+        if val in false_values:
+            return False
+        return False
+
+    return series.apply(_convert).astype(bool)
+
+
+def robust_minmax(series: pd.Series, invert: bool = False, default: float = 0.5) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    if s.notna().sum() == 0:
+        out = pd.Series(default, index=series.index, dtype=float)
+        return 1 - out if invert else out
+    q_low = s.quantile(0.01)
+    q_high = s.quantile(0.99)
+    if not np.isfinite(q_low) or not np.isfinite(q_high) or q_high <= q_low:
+        out = pd.Series(default, index=series.index, dtype=float)
+    else:
+        out = (s.clip(q_low, q_high) - q_low) / (q_high - q_low)
+        out = out.fillna(default).clip(0, 1)
+    return 1 - out if invert else out
+
+
+def percentage_series(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if s.dropna().gt(1).any():
+        return (s / 100).clip(0, 1).fillna(0.5)
+    return s.clip(0, 1).fillna(0.5)
+
+
+def weighted_content_text(row: pd.Series) -> str:
+    tags = split_tokens(row.get("tags", ""))
+    genres = split_tokens(row.get("genres", ""))
+    categories = split_tokens(row.get("categories", ""))
+    developer = split_tokens(row.get("developer", ""))
+    publisher = split_tokens(row.get("publisher", ""))
+    desc = str(row.get("short_description", ""))
+    parts: list[str] = []
+    parts.extend(tags * 5)
+    parts.extend(genres * 4)
+    parts.extend(categories * 2)
+    parts.extend(developer * 2)
+    parts.extend(publisher)
+    parts.extend([desc] * 2)
+    cleaned = " ".join(parts).lower()
+    return cleaned if cleaned.strip() else "unknown game"
+
+
+REQUIRED_COLUMNS = {
+    "app_id": np.nan,
+    "name": "Unknown Game",
+    "release_date": "",
+    "price_usd": np.nan,
+    "discount_pct": 0,
+    "metacritic_score": np.nan,
+    "recommendations": 0,
+    "positive_reviews": 0,
+    "negative_reviews": 0,
+    "avg_playtime_forever": np.nan,
+    "avg_playtime_2weeks": np.nan,
+    "median_playtime": np.nan,
+    "peak_ccu": np.nan,
+    "required_age": np.nan,
+    "dlc_count": 0,
+    "achievements": 0,
+    "genres": "",
+    "categories": "",
+    "tags": "",
+    "developer": "",
+    "publisher": "",
+    "short_description": "",
+    "header_image": "",
+    "estimated_owners": "",
+    "is_free": False,
+}
+
+
+def prepare_games(raw: pd.DataFrame) -> pd.DataFrame:
+    df = canonicalize_columns(raw)
+    for col, default in REQUIRED_COLUMNS.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df = df.copy().reset_index(drop=True)
+    if df["app_id"].isna().all():
+        df["app_id"] = np.arange(1, len(df) + 1)
+
     numeric_cols = [
-        "price_usd", "discount_pct", "metacritic_score", "recommendations",
-        "positive_reviews", "negative_reviews", "avg_playtime_forever",
-        "avg_playtime_2weeks", "median_playtime", "peak_ccu",
-        "required_age", "dlc_count", "achievements",
+        "price_usd",
+        "discount_pct",
+        "metacritic_score",
+        "recommendations",
+        "positive_reviews",
+        "negative_reviews",
+        "avg_playtime_forever",
+        "avg_playtime_2weeks",
+        "median_playtime",
+        "peak_ccu",
+        "required_age",
+        "dlc_count",
+        "achievements",
     ]
     for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
- 
-    # FIX: outlier sentinel di median_playtime (nilai > 99th percentile yang aneh)
-    p99_median = df["median_playtime"].quantile(0.99)
-    df["median_playtime"] = df["median_playtime"].where(
-        df["median_playtime"] <= p99_median, np.nan
-    )
- 
-    # FIX: avg_playtime_2weeks — ganti 0 dengan NaN supaya tidak menyesatkan
-    df["avg_playtime_2weeks"] = df["avg_playtime_2weeks"].replace(0, np.nan)
- 
-    # ── String ────────────────────────────────────────────────────────────────
-    str_cols = [
-        "name", "genres", "categories", "tags", "developer",
-        "publisher", "short_description", "header_image", "estimated_owners",
+        df[col] = to_number(df[col])
+
+    text_cols = [
+        "name",
+        "release_date",
+        "genres",
+        "categories",
+        "tags",
+        "developer",
+        "publisher",
+        "short_description",
+        "header_image",
+        "estimated_owners",
     ]
-    for col in str_cols:
-        if col not in df.columns:
-            df[col] = ""
+    for col in text_cols:
         df[col] = df[col].fillna("").astype(str).replace("nan", "")
- 
-    # FIX: is_free harus boolean bersih, bukan string "True"/"False"
-    if df["is_free"].dtype == object:
-        df["is_free"] = df["is_free"].astype(str).str.lower().map(
-            {"true": True, "false": False, "1": True, "0": False}
-        ).fillna(False)
+
+    df["is_free"] = to_bool(df["is_free"])
+    df.loc[df["price_usd"].fillna(np.inf) <= 0, "is_free"] = True
+
+    if df["release_date"].str.fullmatch(r"\d{4}(\.0)?").all():
+        df["year"] = pd.to_numeric(df["release_date"], errors="coerce")
     else:
-        df["is_free"] = df["is_free"].fillna(False).astype(bool)
- 
-    # ── Derived columns ───────────────────────────────────────────────────────
+        df["year"] = df["release_date"].str.extract(r"((?:19|20)\d{2})")[0]
+        df["year"] = pd.to_numeric(df["year"], errors="coerce")
+
+    # Clean obvious playtime sentinels without erasing valid long games.
+    for col in ["avg_playtime_forever", "avg_playtime_2weeks", "median_playtime"]:
+        if df[col].notna().sum() > 20:
+            upper = df[col].quantile(0.995)
+            df[col] = df[col].where(df[col] <= upper, np.nan)
+
+    df["genre_list"] = df["genres"].apply(split_tokens)
+    df["tag_list"] = df["tags"].apply(split_tokens)
+    df["category_list"] = df["categories"].apply(split_tokens)
+    df["genre_primary"] = df["genre_list"].apply(lambda x: x[0] if x else "Unknown")
+
+    combined = (
+        df["categories"].fillna("") + " " + df["tags"].fillna("") + " " + df["genres"].fillna("")
+    ).str.lower()
+    df["is_singleplayer"] = combined.str.contains("single-player|single player|singleplayer", regex=True, na=False)
+    df["is_multiplayer"] = combined.str.contains("multi-player|multiplayer|online pvp|pvp", regex=True, na=False)
+    df["is_coop"] = combined.str.contains("co-op|coop|cooperative", regex=True, na=False)
+
     df["total_reviews"] = df["positive_reviews"].fillna(0) + df["negative_reviews"].fillna(0)
+    df["review_volume"] = df[["recommendations", "total_reviews"]].max(axis=1).fillna(0)
     df["positivity"] = np.where(
         df["total_reviews"] > 0,
-        df["positive_reviews"] / df["total_reviews"] * 100,
+        (df["positive_reviews"] / df["total_reviews"] * 100),
         np.nan,
-    ).round(1)  # type: ignore[arg-type]
- 
-    df["genre_primary"] = df["genres"].str.split(",").str[0].str.strip()
- 
-    cat = df["categories"].str.lower()
-    df["is_multiplayer"] = cat.str.contains("multi-player|multiplayer", na=False)
-    df["is_coop"]        = cat.str.contains("co-op", na=False)
-    df["is_singleplayer"]= cat.str.contains("single-player", na=False)
- 
-    # FIX: clip outlier sebelum scoring supaya tidak didominasi 1-2 game
-    recs_clipped = df["recommendations"].clip(upper=df["recommendations"].quantile(0.99))
-    df["score_raw"] = df["positivity"] * np.log1p(recs_clipped.fillna(0))
-    mn, mx = df["score_raw"].min(), df["score_raw"].max()
-    df["score"] = ((df["score_raw"] - mn) / (mx - mn) * 100).round(1) if mx > mn else 50.0
- 
-    df["owners_m"] = df["estimated_owners"].apply(parse_owners)
- 
-    # FIX: harga game gratis yang price_usd = 0 pastikan is_free = True juga
-    df.loc[df["price_usd"] == 0, "is_free"] = True
- 
-    # ── TF-IDF matrix untuk content-based ────────────────────────────────────
-    df["_cb_text"] = (
-        df["genre_primary"].fillna("") + " " +
-        df["genres"].fillna("") + " " +
-        df["tags"].fillna("") + " " +
-        df["developer"].fillna("")
-    ).str.lower()
- 
-    return df
- 
- 
-games = load_steam(CSV_PATH)
-all_genres = sorted(g for g in games["genre_primary"].dropna().unique() if g)
-all_titles = sorted(t for t in games["name"].dropna().unique() if t)
- 
-# Semua unique tags, diurutkan berdasarkan frekuensi
-from collections import Counter
-_tag_counter: Counter = Counter()
-for row_tags in games["tags"].dropna():
-    for t in row_tags.split(","):
-        t = t.strip()
-        if t:
-            _tag_counter[t] += 1
-all_tags_ranked = [t for t, _ in _tag_counter.most_common()]  # urut terbanyak dulu
- 
- 
-# ── TF-IDF (dicompute sekali, di-cache di session) ────────────────────────────
-@st.cache_resource
-def build_tfidf(texts: list[str]):
-    """FIX: ganti Jaccard token matching dengan TF-IDF + cosine similarity."""
-    vec = TfidfVectorizer(ngram_range=(1, 2), max_features=5000, min_df=2)
-    mat = vec.fit_transform(texts)
-    return mat
- 
- 
-cb_matrix = build_tfidf(games["_cb_text"].tolist())
- 
- 
-# ── Recommendation engines ────────────────────────────────────────────────────
-def wr_score(df: pd.DataFrame) -> pd.Series:
-    """Bayesian weighted rating (mirip formula IMDb)."""
-    C = df["positivity"].mean()
-    m = df["recommendations"].quantile(0.70)
-    v = df["recommendations"].fillna(0)
+    )
+    # Fallback: if review polarity is unavailable, use metacritic as imperfect rating proxy.
+    df["positivity"] = df["positivity"].fillna(df["metacritic_score"])
+
+    valid_rating = df["positivity"].dropna()
+    C = float(valid_rating.mean()) if len(valid_rating) else 70.0
+    m = float(df["review_volume"].quantile(0.70)) if df["review_volume"].notna().any() else 50.0
+    if not np.isfinite(m) or m <= 0:
+        m = 50.0
+    v = df["review_volume"].fillna(0)
     R = df["positivity"].fillna(C)
-    return ((v / (v + m)) * R + (m / (v + m)) * C).round(2)
- 
- 
-def rec_rule(
-    df: pd.DataFrame,
-    genres: list[str],
+    df["bayes_rating"] = ((v / (v + m)) * R + (m / (v + m)) * C).clip(0, 100)
+
+    df["owners_m"] = df["estimated_owners"].apply(parse_owners)
+    df["price_effective"] = np.where(df["is_free"], 0.0, df["price_usd"].fillna(df["price_usd"].median()))
+    df["playtime_h"] = df["avg_playtime_forever"] / 60
+
+    df["rating_score"] = (df["bayes_rating"] / 100).fillna(0.5).clip(0, 1)
+    df["popularity_score"] = robust_minmax(np.log1p(df["review_volume"].fillna(0)))
+    df["metacritic_norm"] = percentage_series(df["metacritic_score"])
+    df["playtime_score"] = robust_minmax(np.log1p(df["avg_playtime_forever"].fillna(0)))
+    df["recency_score"] = robust_minmax(df["year"].fillna(df["year"].median()))
+    df["affordability_score"] = robust_minmax(df["price_effective"].fillna(0), invert=True)
+    df["discount_score"] = percentage_series(df["discount_pct"].fillna(0))
+    df["novelty_score"] = (1 - df["popularity_score"]).clip(0, 1)
+
+    df["quality_score"] = (
+        0.34 * df["rating_score"]
+        + 0.22 * df["popularity_score"]
+        + 0.16 * df["metacritic_norm"]
+        + 0.12 * df["playtime_score"]
+        + 0.10 * df["recency_score"]
+        + 0.06 * df["affordability_score"]
+    ).clip(0, 1)
+    df["crowd_score"] = (
+        0.52 * df["rating_score"]
+        + 0.32 * df["popularity_score"]
+        + 0.11 * df["metacritic_norm"]
+        + 0.05 * df["playtime_score"]
+    ).clip(0, 1)
+    df["value_score"] = (
+        0.48 * df["quality_score"]
+        + 0.32 * df["affordability_score"]
+        + 0.12 * df["discount_score"]
+        + 0.08 * df["rating_score"]
+    ).clip(0, 1)
+    df["display_score"] = (df["quality_score"] * 100).round(1)
+    df["content_text"] = df.apply(weighted_content_text, axis=1)
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_games_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_csv(io.BytesIO(file_bytes))
+    return prepare_games(raw)
+
+
+@st.cache_data(show_spinner=False)
+def load_games_from_path(path_text: str) -> pd.DataFrame:
+    raw = pd.read_csv(path_text)
+    return prepare_games(raw)
+
+
+@st.cache_resource(show_spinner=False)
+def build_tfidf(texts: tuple[str, ...]):
+    safe_texts = tuple(t if str(t).strip() else "unknown game" for t in texts)
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+        max_df=0.95,
+        max_features=20000,
+        token_pattern=r"(?u)\b[\w\-]+\b",
+    )
+    matrix = vectorizer.fit_transform(safe_texts)
+    return vectorizer, matrix
+
+
+@st.cache_data(show_spinner=False)
+def load_interactions_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+    return canonicalize_columns(pd.read_csv(io.BytesIO(file_bytes)))
+
+
+# -----------------------------------------------------------------------------
+# Recommendation functions
+# -----------------------------------------------------------------------------
+def top_values_from_lists(df: pd.DataFrame, list_col: str, limit: int = 80) -> list[str]:
+    counter: Counter[str] = Counter()
+    if list_col not in df.columns:
+        return []
+    for values in df[list_col]:
+        if isinstance(values, list):
+            counter.update(values)
+    return [name for name, _ in counter.most_common(limit)]
+
+
+def normalize_array(arr: np.ndarray, default: float = 0.0) -> np.ndarray:
+    arr = np.asarray(arr, dtype=float)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.full_like(arr, default, dtype=float)
+    clean = arr.copy()
+    clean[~finite] = np.nan
+    mn = np.nanmin(clean)
+    mx = np.nanmax(clean)
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+        return np.full_like(arr, default if default else 0.5, dtype=float)
+    clean = (clean - mn) / (mx - mn)
+    clean = np.nan_to_num(clean, nan=default, posinf=1.0, neginf=0.0)
+    return np.clip(clean, 0, 1)
+
+
+def content_scores(
+    games: pd.DataFrame,
+    matrix,
+    vectorizer: TfidfVectorizer,
+    favorite_titles: Sequence[str],
+    preferred_genres: Sequence[str],
+    preferred_tags: Sequence[str],
+    mood_terms: Sequence[str],
+) -> np.ndarray:
+    n = len(games)
+    score = np.zeros(n, dtype=float)
+    weight_total = 0.0
+
+    if favorite_titles:
+        title_lookup = {str(name).lower(): idx for idx, name in games["name"].items()}
+        fav_indices = [title_lookup[t.lower()] for t in favorite_titles if t.lower() in title_lookup]
+        if fav_indices:
+            fav_sim = cosine_similarity(matrix[fav_indices], matrix).mean(axis=0)
+            score += 0.72 * np.asarray(fav_sim).ravel()
+            weight_total += 0.72
+
+    profile_terms: list[str] = []
+    profile_terms.extend(list(preferred_genres) * 4)
+    profile_terms.extend(list(preferred_tags) * 5)
+    profile_terms.extend(list(mood_terms) * 3)
+    if profile_terms:
+        query_text = " ".join(profile_terms).lower()
+        query_vec = vectorizer.transform([query_text])
+        term_sim = cosine_similarity(query_vec, matrix).ravel()
+        score += 0.28 * term_sim
+        weight_total += 0.28
+
+    if weight_total <= 0:
+        return np.zeros(n, dtype=float)
+    return np.clip(score / weight_total, 0, 1)
+
+
+def rule_scores(
+    games: pd.DataFrame,
+    preferred_genres: Sequence[str],
+    preferred_tags: Sequence[str],
     max_price: float,
-    min_pos: float,
-    min_recs: int,
+    min_positivity: float,
     mode: str,
-    top_n: int,
+) -> np.ndarray:
+    genre_set = {g.lower() for g in preferred_genres}
+    tag_set = {t.lower() for t in preferred_tags}
+    scores = []
+    for _, row in games.iterrows():
+        score = 0.0
+        score += 0.35 * float(row.get("quality_score", 0.5))
+        score += 0.15 * float(row.get("affordability_score", 0.5))
+
+        if genre_set:
+            row_genres = {g.lower() for g in row.get("genre_list", [])}
+            score += 0.20 * (len(row_genres & genre_set) / max(1, len(genre_set)))
+        else:
+            score += 0.10
+
+        if tag_set:
+            row_tags = {t.lower() for t in row.get("tag_list", [])}
+            score += 0.22 * (len(row_tags & tag_set) / max(1, len(tag_set)))
+        else:
+            score += 0.08
+
+        price = float(row.get("price_effective", np.nan))
+        if bool(row.get("is_free", False)) or (np.isfinite(price) and price <= max_price):
+            score += 0.06
+        pos = float(row.get("positivity", np.nan))
+        if np.isfinite(pos) and pos >= min_positivity:
+            score += 0.05
+        if mode == "singleplayer" and bool(row.get("is_singleplayer", False)):
+            score += 0.07
+        elif mode == "multiplayer" and bool(row.get("is_multiplayer", False)):
+            score += 0.07
+        elif mode == "coop" and bool(row.get("is_coop", False)):
+            score += 0.07
+        elif mode == "any":
+            score += 0.04
+        scores.append(score)
+    return np.clip(np.asarray(scores, dtype=float), 0, 1)
+
+
+def apply_candidate_filters(
+    games: pd.DataFrame,
+    max_price: float,
+    min_positivity: float,
+    min_reviews: int,
+    preferred_genres: Sequence[str],
+    must_have_tags: Sequence[str],
+    mode: str,
+    exclude_titles: Sequence[str],
 ) -> pd.DataFrame:
-    res = df.copy()
-    if genres:
-        res = res[res["genre_primary"].isin(genres)]
- 
-    # FIX: is_free sekarang boolean bersih, bisa langsung dipakai
-    price_ok = (res["price_usd"].fillna(9999) <= max_price) | res["is_free"]
+    res = games.copy()
+    price_ok = (res["price_effective"].fillna(np.inf) <= max_price) | res["is_free"].fillna(False)
     res = res[price_ok]
-    res = res[res["positivity"].fillna(0) >= min_pos]
-    res = res[res["recommendations"].fillna(0) >= min_recs]
- 
-    if mode == "multiplayer":
+    res = res[res["positivity"].fillna(0) >= min_positivity]
+    res = res[res["review_volume"].fillna(0) >= min_reviews]
+
+    if preferred_genres:
+        genre_set = {g.lower() for g in preferred_genres}
+        res = res[res["genre_list"].apply(lambda xs: bool({x.lower() for x in xs} & genre_set))]
+
+    for tag in must_have_tags:
+        res = res[res["tag_list"].apply(lambda xs, t=tag: any(x.lower() == t.lower() for x in xs))]
+
+    if mode == "singleplayer":
+        res = res[res["is_singleplayer"]]
+    elif mode == "multiplayer":
         res = res[res["is_multiplayer"]]
     elif mode == "coop":
         res = res[res["is_coop"]]
-    elif mode == "singleplayer":
-        res = res[res["is_singleplayer"]]
- 
-    return res.sort_values("score", ascending=False).head(top_n)
- 
- 
-def rec_cb(df: pd.DataFrame, ref_name: str, top_n: int) -> pd.DataFrame:
-    """FIX: TF-IDF cosine similarity, jauh lebih akurat."""
-    if not ref_name:
-        return pd.DataFrame()
- 
-    idx = df.index[df["name"].str.lower() == ref_name.lower()]
-    if idx.empty:
-        return pd.DataFrame()
- 
-    ref_idx = idx[0]
-    ref_vec = cb_matrix[df.index.get_loc(ref_idx)]
-    sims = cosine_similarity(ref_vec, cb_matrix).flatten()
- 
-    res = df.copy()
-    res["cb_score"] = sims
-    res = res[res["name"].str.lower() != ref_name.lower()]
-    return res.sort_values("cb_score", ascending=False).head(top_n)
- 
- 
-def rec_cf(
-    df: pd.DataFrame, genres: list[str], min_pos: float, top_n: int
+
+    if exclude_titles:
+        exclude = {t.lower() for t in exclude_titles}
+        res = res[~res["name"].str.lower().isin(exclude)]
+
+    return res
+
+
+def build_interaction_cf_scores(
+    games: pd.DataFrame,
+    interactions: pd.DataFrame | None,
+    favorite_titles: Sequence[str],
+) -> np.ndarray | None:
+    if interactions is None or interactions.empty or sparse is None or not favorite_titles:
+        return None
+
+    df_int = canonicalize_columns(interactions)
+    if "user_id" not in df_int.columns:
+        for candidate in ["user", "uid", "steamid", "steam_id"]:
+            if candidate in df_int.columns:
+                df_int = df_int.rename(columns={candidate: "user_id"})
+                break
+    if "user_id" not in df_int.columns:
+        return None
+
+    id_col = None
+    if "app_id" in df_int.columns and "app_id" in games.columns:
+        id_col = "app_id"
+    elif "name" in df_int.columns:
+        id_col = "name"
+    else:
+        return None
+
+    if "rating" in df_int.columns:
+        values = to_number(df_int["rating"]).fillna(0).clip(lower=0)
+    elif "playtime_forever" in df_int.columns:
+        values = np.log1p(to_number(df_int["playtime_forever"]).fillna(0))
+    elif "liked" in df_int.columns:
+        values = to_bool(df_int["liked"]).astype(int)
+    else:
+        values = pd.Series(1.0, index=df_int.index)
+
+    if id_col == "app_id":
+        item_map = pd.Series(games.index.values, index=games["app_id"].astype(str)).to_dict()
+        item_idx = df_int["app_id"].astype(str).map(item_map)
+    else:
+        item_map = pd.Series(games.index.values, index=games["name"].str.lower()).to_dict()
+        item_idx = df_int["name"].astype(str).str.lower().map(item_map)
+
+    valid = item_idx.notna() & df_int["user_id"].notna() & values.notna() & (values > 0)
+    if valid.sum() < 3:
+        return None
+
+    users = pd.factorize(df_int.loc[valid, "user_id"].astype(str))[0]
+    items = item_idx.loc[valid].astype(int).to_numpy()
+    vals = values.loc[valid].astype(float).to_numpy()
+    mat = sparse.csr_matrix((vals, (users, items)), shape=(users.max() + 1, len(games)))
+
+    title_lookup = {str(name).lower(): idx for idx, name in games["name"].items()}
+    fav_indices = [title_lookup[t.lower()] for t in favorite_titles if t.lower() in title_lookup]
+    if not fav_indices:
+        return None
+    item_user = mat.T.tocsr()
+    sims = cosine_similarity(item_user[fav_indices], item_user).mean(axis=0)
+    return np.asarray(sims).ravel()
+
+
+def mmr_rerank(
+    candidates: pd.DataFrame,
+    matrix,
+    score_col: str,
+    top_n: int,
+    diversity: float,
 ) -> pd.DataFrame:
-    res = df.copy()
-    if genres:
-        res = res[res["genre_primary"].isin(genres)]
-    res = res[res["positivity"].fillna(0) >= min_pos]
-    # FIX: filter game dengan terlalu sedikit review
-    res = res[res["recommendations"].fillna(0) >= 50]
-    res["wr"] = wr_score(res)
-    return res.sort_values("wr", ascending=False).head(top_n)
- 
- 
-def rec_hybrid(
-    df: pd.DataFrame, ref_name: str, top_n: int, cb_w: float = 0.6
+    if candidates.empty:
+        return candidates
+    pool_size = min(len(candidates), max(top_n * 12, 80))
+    pool = candidates.sort_values(score_col, ascending=False).head(pool_size).copy()
+    if diversity <= 0 or len(pool) <= top_n:
+        return pool.head(top_n)
+
+    rel = normalize_array(pool[score_col].to_numpy(), default=0.5)
+    idxs = pool.index.to_list()
+    selected_positions: list[int] = []
+    remaining_positions = list(range(len(idxs)))
+    lambda_rel = float(np.clip(1 - diversity, 0.35, 0.95))
+
+    while remaining_positions and len(selected_positions) < top_n:
+        if not selected_positions:
+            best = max(remaining_positions, key=lambda p: rel[p])
+        else:
+            remaining_idxs = [idxs[p] for p in remaining_positions]
+            selected_idxs = [idxs[p] for p in selected_positions]
+            sim_to_selected = cosine_similarity(matrix[remaining_idxs], matrix[selected_idxs]).max(axis=1)
+            mmr_values = []
+            for local_i, p in enumerate(remaining_positions):
+                mmr_values.append(lambda_rel * rel[p] - diversity * float(sim_to_selected[local_i]))
+            best = remaining_positions[int(np.argmax(mmr_values))]
+        selected_positions.append(best)
+        remaining_positions.remove(best)
+
+    selected_indices = [idxs[p] for p in selected_positions]
+    return pool.loc[selected_indices]
+
+
+def recommend_games(
+    games: pd.DataFrame,
+    matrix,
+    vectorizer: TfidfVectorizer,
+    engine: str,
+    favorite_titles: Sequence[str],
+    preferred_genres: Sequence[str],
+    preferred_tags: Sequence[str],
+    must_have_tags: Sequence[str],
+    mood_terms: Sequence[str],
+    max_price: float,
+    min_positivity: float,
+    min_reviews: int,
+    mode: str,
+    top_n: int,
+    diversity: float,
+    weights: dict[str, float],
+    interactions: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    cb = rec_cb(df, ref_name, len(df))
-    if cb.empty:
-        return cb
- 
-    cb["wr"] = wr_score(cb)
- 
-    scaler = MinMaxScaler()
-    cb["cb_norm"] = scaler.fit_transform(cb[["cb_score"]].fillna(0))
-    cb["wr_norm"] = scaler.fit_transform(cb[["wr"]].fillna(0))
-    cb["hybrid_score"] = cb_w * cb["cb_norm"] + (1 - cb_w) * cb["wr_norm"]
- 
-    return cb.sort_values("hybrid_score", ascending=False).head(top_n)
- 
- 
-# ── Session state ─────────────────────────────────────────────────────────────
-if "active_tags" not in st.session_state:
-    st.session_state.active_tags = set()
- 
-# ── Sidebar filters ───────────────────────────────────────────────────────────
-st.sidebar.title("⚙️ Filters")
- 
-min_year = int(games["year"].dropna().min()) if games["year"].notna().any() else 2000
-max_year = int(games["year"].dropna().max()) if games["year"].notna().any() else 2026
- 
-f_year   = st.sidebar.slider("Release Year", min_year, max_year, (min_year, max_year))
-f_price  = st.sidebar.slider("Max Price ($)", 0, 150, 60)
-f_pos    = st.sidebar.slider("Min Positivity (%)", 0, 100, 0)
-f_genre  = st.sidebar.selectbox("Genre", ["All"] + all_genres)
-f_mode   = st.sidebar.selectbox("Mode", ["any", "singleplayer", "multiplayer", "coop"])
- 
-# NOTE: filter sidebar berlaku di Discover & Analytics.
-# Tab Recommend punya filter sendiri yang independen (by design).
-st.sidebar.info("💡 Filter di atas berlaku untuk tab Discover & Analytics.")
- 
- 
-def get_filtered_data() -> pd.DataFrame:
+    candidate_df = apply_candidate_filters(
+        games=games,
+        max_price=max_price,
+        min_positivity=min_positivity,
+        min_reviews=min_reviews,
+        preferred_genres=preferred_genres,
+        must_have_tags=must_have_tags,
+        mode=mode,
+        exclude_titles=favorite_titles,
+    )
+    if candidate_df.empty:
+        return candidate_df
+
+    content = content_scores(games, matrix, vectorizer, favorite_titles, preferred_genres, preferred_tags, mood_terms)
+    rule = rule_scores(games, preferred_genres, preferred_tags, max_price, min_positivity, mode)
+    cf_true = build_interaction_cf_scores(games, interactions, favorite_titles)
+    if cf_true is None:
+        cf = games["crowd_score"].to_numpy(dtype=float)
+        cf_label = "Crowd proxy"
+    else:
+        cf = normalize_array(cf_true, default=0.0)
+        cf_label = "User-item CF"
+
+    scores = pd.DataFrame(
+        {
+            "content_component": normalize_array(content, default=0.0),
+            "rule_component": normalize_array(rule, default=0.5),
+            "crowd_component": normalize_array(cf, default=0.5),
+            "quality_component": games["quality_score"].to_numpy(dtype=float),
+            "value_component": games["value_score"].to_numpy(dtype=float),
+            "novelty_component": games["novelty_score"].to_numpy(dtype=float),
+        },
+        index=games.index,
+    )
+
+    if engine == "Content-Based":
+        final = 0.78 * scores["content_component"] + 0.14 * scores["quality_component"] + 0.08 * scores["value_component"]
+    elif engine == "Rule-Based":
+        final = 0.65 * scores["rule_component"] + 0.22 * scores["quality_component"] + 0.13 * scores["value_component"]
+    elif engine == "Collaborative / Crowd":
+        final = 0.74 * scores["crowd_component"] + 0.16 * scores["quality_component"] + 0.10 * scores["novelty_component"]
+    else:
+        total_w = max(1e-9, sum(max(0.0, v) for v in weights.values()))
+        normalized = {k: max(0.0, v) / total_w for k, v in weights.items()}
+        final = (
+            normalized.get("content", 0.0) * scores["content_component"]
+            + normalized.get("crowd", 0.0) * scores["crowd_component"]
+            + normalized.get("rule", 0.0) * scores["rule_component"]
+            + normalized.get("value", 0.0) * scores["value_component"]
+            + normalized.get("novelty", 0.0) * scores["novelty_component"]
+        )
+
+    out = candidate_df.join(scores, how="left")
+    out["final_score"] = final.loc[out.index].clip(0, 1)
+    out["final_score_pct"] = (out["final_score"] * 100).round(1)
+    out["cf_source"] = cf_label
+    out = mmr_rerank(out, matrix, "final_score", top_n, diversity)
+    return out.sort_values("final_score", ascending=False).head(top_n)
+
+
+# -----------------------------------------------------------------------------
+# UI helpers
+# -----------------------------------------------------------------------------
+def esc(value: object) -> str:
+    return html.escape("" if pd.isna(value) else str(value))
+
+
+def fmt_int(value: object) -> str:
+    try:
+        if not np.isfinite(float(value)):
+            return "-"
+        return f"{int(float(value)):,}"
+    except Exception:
+        return "-"
+
+
+def fmt_float(value: object, digits: int = 1, suffix: str = "") -> str:
+    try:
+        val = float(value)
+        if not np.isfinite(val):
+            return "-"
+        return f"{val:.{digits}f}{suffix}"
+    except Exception:
+        return "-"
+
+
+def steam_url(row: pd.Series) -> str:
+    try:
+        app_id = int(float(row.get("app_id", np.nan)))
+        if app_id > 0:
+            return f"https://store.steampowered.com/app/{app_id}/"
+    except Exception:
+        pass
+    return ""
+
+
+def price_badge(row: pd.Series) -> str:
+    if bool(row.get("is_free", False)):
+        return "<span class='pill pill-green'>Free</span>"
+    price = row.get("price_effective", np.nan)
+    if pd.notna(price):
+        base = f"<span class='pill pill-blue'>${float(price):.2f}</span>"
+    else:
+        base = "<span class='pill'>Price n/a</span>"
+    discount = row.get("discount_pct", 0)
+    try:
+        if float(discount) > 0:
+            base += f"<span class='pill pill-red'>-{int(float(discount))}%</span>"
+    except Exception:
+        pass
+    return base
+
+
+def component_bar(label: str, value: float) -> str:
+    value = float(np.clip(value if np.isfinite(value) else 0, 0, 1))
+    pct = int(round(value * 100))
+    return f"""
+    <div class='bar-row'>
+      <div class='bar-label'><span>{esc(label)}</span><span>{pct}</span></div>
+      <div class='bar-track'><div class='bar-fill' style='width:{pct}%'></div></div>
+    </div>
+    """
+
+
+def explain_row(row: pd.Series, games: pd.DataFrame, favorite_titles: Sequence[str], preferred_tags: Sequence[str]) -> str:
+    reasons: list[str] = []
+    if favorite_titles:
+        fav_rows = games[games["name"].isin(favorite_titles)]
+        fav_tags = set()
+        fav_genres = set()
+        for _, fav in fav_rows.iterrows():
+            fav_tags.update([x.lower() for x in fav.get("tag_list", [])])
+            fav_genres.update([x.lower() for x in fav.get("genre_list", [])])
+        row_tags = {x.lower() for x in row.get("tag_list", [])}
+        row_genres = {x.lower() for x in row.get("genre_list", [])}
+        shared_tags = [t for t in row.get("tag_list", []) if t.lower() in fav_tags][:4]
+        shared_genres = [g for g in row.get("genre_list", []) if g.lower() in fav_genres][:3]
+        if shared_tags:
+            reasons.append("similar tags: " + ", ".join(shared_tags))
+        elif shared_genres:
+            reasons.append("similar genres: " + ", ".join(shared_genres))
+    if preferred_tags:
+        matched = [t for t in row.get("tag_list", []) if t.lower() in {x.lower() for x in preferred_tags}][:4]
+        if matched:
+            reasons.append("matches preference: " + ", ".join(matched))
+    try:
+        if float(row.get("bayes_rating", 0)) >= 85:
+            reasons.append("strong Bayesian crowd rating")
+    except Exception:
+        pass
+    try:
+        if float(row.get("value_score", 0)) >= 0.72:
+            reasons.append("good value for money")
+    except Exception:
+        pass
+    if bool(row.get("is_free", False)):
+        reasons.append("free to play")
+    if not reasons:
+        reasons.append("high combined recommendation score")
+    return "; ".join(reasons[:3])
+
+
+def game_card_html(
+    row: pd.Series,
+    games: pd.DataFrame,
+    favorite_titles: Sequence[str] = (),
+    preferred_tags: Sequence[str] = (),
+    show_components: bool = False,
+) -> str:
+    title = esc(row.get("name", "Unknown Game"))
+    url = steam_url(row)
+    title_html = f"<a href='{url}' target='_blank'>{title}</a>" if url else title
+    img = esc(row.get("header_image", ""))
+    img_html = f"<img src='{img}' onerror=\"this.style.display='none'\"/>" if img else ""
+    genre = esc(row.get("genre_primary", "Unknown"))
+    year = fmt_int(row.get("year"))
+    score = fmt_float(row.get("final_score_pct", row.get("display_score", 0)), 1)
+    pos = fmt_float(row.get("positivity"), 1, "%")
+    recs = fmt_int(row.get("review_volume"))
+    play = fmt_float(row.get("playtime_h"), 1, "h")
+    tags = row.get("tag_list", []) if isinstance(row.get("tag_list", []), list) else []
+    tag_html = "".join(f"<span class='tag'>{esc(t)}</span>" for t in tags[:7])
+    why = esc(explain_row(row, games, favorite_titles, preferred_tags))
+    comp_html = ""
+    if show_components:
+        comp_html = (
+            component_bar("Content match", float(row.get("content_component", 0)))
+            + component_bar("Crowd signal", float(row.get("crowd_component", 0)))
+            + component_bar("Rule fit", float(row.get("rule_component", 0)))
+            + component_bar("Value", float(row.get("value_component", 0)))
+        )
+    return f"""
+    <div class='game-card'>
+      <div class='game-img-wrap'>{img_html}</div>
+      <div class='game-body'>
+        <div class='game-title'>{title_html}</div>
+        <div class='meta-line'>{genre} | {year} | {price_badge(row)}</div>
+        <div class='pill-row'>
+          <span class='pill pill-blue'>Score {score}</span>
+          <span class='pill pill-green'>Pos {pos}</span>
+          <span class='pill'>Reviews {recs}</span>
+          <span class='pill'>Playtime {play}</span>
+        </div>
+        <div>{tag_html}</div>
+        {comp_html}
+        <div class='why'><b>Why:</b> {why}</div>
+      </div>
+    </div>
+    """
+
+
+def render_cards(
+    rows: pd.DataFrame,
+    games: pd.DataFrame,
+    favorite_titles: Sequence[str] = (),
+    preferred_tags: Sequence[str] = (),
+    columns: int = 3,
+    show_components: bool = False,
+) -> None:
+    if rows.empty:
+        st.info("Tidak ada data yang cocok dengan filter saat ini.")
+        return
+    cards = st.columns(columns)
+    for i, (_, row) in enumerate(rows.iterrows()):
+        with cards[i % columns]:
+            st.markdown(
+                game_card_html(row, games, favorite_titles, preferred_tags, show_components),
+                unsafe_allow_html=True,
+            )
+
+
+def apply_global_filters(
+    games: pd.DataFrame,
+    year_range: tuple[int, int],
+    max_price: float,
+    min_pos: float,
+    genres: Sequence[str],
+    tags: Sequence[str],
+    mode: str,
+    search: str,
+) -> pd.DataFrame:
     df = games.copy()
-    df = df[df["year"].fillna(0).between(f_year[0], f_year[1])]
- 
-    # FIX: is_free boolean bersih → tidak ada lagi ValueError
-    price_ok = (df["price_usd"].fillna(9999) <= f_price) | df["is_free"]
-    df = df[price_ok]
-    df = df[df["positivity"].fillna(0) >= f_pos]
- 
-    if f_genre != "All":
-        df = df[df["genre_primary"] == f_genre]
- 
-    if f_mode == "singleplayer":
+    if df["year"].notna().any():
+        df = df[df["year"].fillna(0).between(year_range[0], year_range[1])]
+    df = df[(df["price_effective"].fillna(np.inf) <= max_price) | df["is_free"]]
+    df = df[df["positivity"].fillna(0) >= min_pos]
+    if genres:
+        genre_set = {g.lower() for g in genres}
+        df = df[df["genre_list"].apply(lambda xs: bool({x.lower() for x in xs} & genre_set))]
+    for tag in tags:
+        df = df[df["tag_list"].apply(lambda xs, t=tag: any(x.lower() == t.lower() for x in xs))]
+    if mode == "singleplayer":
         df = df[df["is_singleplayer"]]
-    elif f_mode == "multiplayer":
+    elif mode == "multiplayer":
         df = df[df["is_multiplayer"]]
-    elif f_mode == "coop":
+    elif mode == "coop":
         df = df[df["is_coop"]]
- 
-    # Filter berdasarkan tag aktif (AND: harus punya semua tag yang dipilih)
-    for tag in st.session_state.active_tags:
-        df = df[df["tags"].str.contains(re.escape(tag), case=False, na=False)]
- 
+    if search.strip():
+        pat = re.escape(search.strip())
+        df = df[df["name"].str.contains(pat, case=False, regex=True, na=False)]
     return df
- 
- 
-filt = get_filtered_data()
- 
- 
-# ── Header ────────────────────────────────────────────────────────────────────
+
+
+def clean_plotly(fig: go.Figure, height: int = 360) -> go.Figure:
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#dbeafe"),
+        margin=dict(l=12, r=12, t=55, b=12),
+        height=height,
+    )
+    return fig
+
+
+def safe_top_tags(df: pd.DataFrame, n: int = 20) -> pd.DataFrame:
+    counter: Counter[str] = Counter()
+    for values in df.get("tag_list", []):
+        if isinstance(values, list):
+            counter.update(values)
+    return pd.DataFrame(counter.most_common(n), columns=["tag", "count"])
+
+
+# -----------------------------------------------------------------------------
+# Main app
+# -----------------------------------------------------------------------------
+inject_css()
+
+st.sidebar.markdown("## SteamVault Pro")
+st.sidebar.caption("Dashboard analisis dan sistem rekomendasi game Steam.")
+uploaded_games = st.sidebar.file_uploader("Upload CSV dataset game", type=["csv"], help="Opsional. Jika kosong, aplikasi membaca steam_top_games_2026.csv di folder yang sama.")
+uploaded_interactions = st.sidebar.file_uploader(
+    "Opsional: upload interaksi user-item",
+    type=["csv"],
+    help="Untuk true collaborative filtering. Kolom minimal: user_id dan app_id/name; rating/playtime/liked opsional.",
+)
+
+try:
+    if uploaded_games is not None:
+        games = load_games_from_bytes(uploaded_games.getvalue())
+        data_source = uploaded_games.name
+    elif DEFAULT_CSV.exists():
+        games = load_games_from_path(str(DEFAULT_CSV))
+        data_source = DEFAULT_CSV.name
+    else:
+        st.error("CSV belum ditemukan. Upload dataset melalui sidebar atau letakkan steam_top_games_2026.csv di folder app.")
+        st.stop()
+except Exception as exc:
+    st.error(f"Gagal membaca dataset: {exc}")
+    st.stop()
+
+interactions = None
+if uploaded_interactions is not None:
+    try:
+        interactions = load_interactions_from_bytes(uploaded_interactions.getvalue())
+    except Exception as exc:
+        st.sidebar.warning(f"Interaksi gagal dibaca: {exc}")
+
+vectorizer, tfidf_matrix = build_tfidf(tuple(games["content_text"].tolist()))
+all_titles = sorted(games["name"].dropna().astype(str).unique().tolist())
+all_genres = sorted([g for g in games["genre_primary"].dropna().unique().tolist() if g and g != "Unknown"])
+all_tags = top_values_from_lists(games, "tag_list", limit=120)
+
+# Sidebar global filters
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Filter global")
+years = games["year"].dropna()
+if years.empty:
+    min_year, max_year = 1990, 2030
+else:
+    min_year, max_year = int(years.min()), int(years.max())
+year_range = st.sidebar.slider("Tahun rilis", min_year, max_year, (min_year, max_year))
+price_limit_global = float(np.nanquantile(games["price_effective"].fillna(0), 0.98)) if len(games) else 100.0
+price_limit_global = max(10.0, min(200.0, price_limit_global))
+global_price = st.sidebar.slider("Harga maksimum global ($)", 0.0, float(math.ceil(price_limit_global)), min(60.0, float(math.ceil(price_limit_global))), 1.0)
+global_min_pos = st.sidebar.slider("Minimal positivity global (%)", 0, 100, 0)
+global_genres = st.sidebar.multiselect("Genre global", all_genres, max_selections=5)
+global_tags = st.sidebar.multiselect("Tag wajib global", all_tags, max_selections=5)
+global_mode = st.sidebar.selectbox("Mode global", ["any", "singleplayer", "multiplayer", "coop"])
+global_search = st.sidebar.text_input("Cari judul")
+filtered = apply_global_filters(games, year_range, global_price, global_min_pos, global_genres, global_tags, global_mode, global_search)
+
 st.markdown(
-    "<div class='hero'><h1>🎮 STEAMVAULT</h1>"
-    "<p>Modern game discovery & recommendation dashboard</p></div>",
+    f"""
+    <div class='hero'>
+      <div class='hero-kicker'>Recommendation System Dashboard</div>
+      <h1>{APP_TITLE}</h1>
+      <p>
+        Dashboard ini menggabungkan eksplorasi data, content-based recommendation, rule-based filtering,
+        crowd/collaborative signal, dan weighted hybrid recommendation. Fokusnya bukan hanya menampilkan data,
+        tetapi juga menjelaskan kenapa sebuah game direkomendasikan.
+      </p>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
- 
-tab_discover, tab_detail, tab_recommend, tab_analytics = st.tabs(
-    ["⚡ Discover", "🔬 Detail", "🎯 Recommend", "📡 Analytics"]
+
+st.caption(f"Data source: {data_source} | Jumlah data: {len(games):,} game | Setelah filter: {len(filtered):,} game")
+
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+kpi1.metric("Total games", f"{len(games):,}")
+kpi2.metric("Filtered", f"{len(filtered):,}")
+kpi3.metric("Free games", f"{int(filtered['is_free'].sum()):,}" if not filtered.empty else "0")
+kpi4.metric("Avg positivity", fmt_float(filtered["positivity"].mean() if not filtered.empty else np.nan, 1, "%"))
+kpi5.metric("Avg score", fmt_float((filtered["quality_score"].mean() * 100) if not filtered.empty else np.nan, 1))
+
+
+tab_overview, tab_explore, tab_recommender, tab_evaluation, tab_method = st.tabs(
+    ["Ringkasan", "Eksplorasi", "Rekomendasi", "Evaluasi", "Metodologi"]
 )
- 
- 
-# ── DISCOVER ──────────────────────────────────────────────────────────────────
-with tab_discover:
- 
-    # ── Tag filter bar ────────────────────────────────────────────────────────
-    if st.session_state.active_tags:
-        active_list = sorted(st.session_state.active_tags)
-        chips_html = " ".join(
-            f"<span class='tag-chip active'>{t} ✕</span>" for t in active_list
+
+with tab_overview:
+    st.markdown("<div class='section-title'><h3>Insight utama</h3><span class='muted'>overview dataset</span></div>", unsafe_allow_html=True)
+    if filtered.empty:
+        st.warning("Tidak ada data pada filter global saat ini.")
+    else:
+        c1, c2 = st.columns([1.12, 0.88])
+        with c1:
+            genre_count = filtered.groupby("genre_primary", as_index=False).size().sort_values("size", ascending=False).head(14)
+            fig = px.bar(genre_count, x="size", y="genre_primary", orientation="h", title="Top genre berdasarkan jumlah game", labels={"size": "Jumlah", "genre_primary": "Genre"})
+            fig.update_yaxes(categoryorder="total ascending")
+            st.plotly_chart(clean_plotly(fig, height=430), use_container_width=True)
+        with c2:
+            top_tags = safe_top_tags(filtered, 14)
+            if not top_tags.empty:
+                fig = px.bar(top_tags, x="count", y="tag", orientation="h", title="Top tag paling sering muncul", labels={"count": "Jumlah", "tag": "Tag"})
+                fig.update_yaxes(categoryorder="total ascending")
+                st.plotly_chart(clean_plotly(fig, height=430), use_container_width=True)
+
+        c3, c4 = st.columns(2)
+        with c3:
+            price_df = filtered[filtered["price_effective"].notna()].copy()
+            fig = px.histogram(price_df, x="price_effective", nbins=30, title="Distribusi harga", labels={"price_effective": "Harga efektif ($)", "count": "Jumlah"})
+            st.plotly_chart(clean_plotly(fig, height=340), use_container_width=True)
+        with c4:
+            scatter = filtered.copy()
+            scatter["review_volume_log"] = np.log10(scatter["review_volume"].fillna(0) + 1)
+            fig = px.scatter(
+                scatter,
+                x="positivity",
+                y="display_score",
+                size="review_volume_log",
+                color="genre_primary",
+                hover_name="name",
+                title="Positivity vs quality score",
+                labels={"positivity": "Positivity (%)", "display_score": "Quality score", "review_volume_log": "Log reviews", "genre_primary": "Genre"},
+            )
+            st.plotly_chart(clean_plotly(fig, height=340), use_container_width=True)
+
+        st.markdown("<div class='section-title'><h3>Top picks cepat</h3><span class='muted'>quality, value, dan popularity</span></div>", unsafe_allow_html=True)
+        pick_cols = st.columns(3)
+        quick_sets = [
+            ("Best Quality", filtered.sort_values("quality_score", ascending=False).head(3)),
+            ("Best Value", filtered.sort_values("value_score", ascending=False).head(3)),
+            ("Crowd Favorite", filtered.sort_values("crowd_score", ascending=False).head(3)),
+        ]
+        for col, (label, data) in zip(pick_cols, quick_sets):
+            with col:
+                st.markdown(f"<div class='glass-panel'><b>{esc(label)}</b></div>", unsafe_allow_html=True)
+                render_cards(data, games, columns=1)
+
+with tab_explore:
+    st.markdown("<div class='section-title'><h3>Game explorer</h3><span class='muted'>browse dan shortlist kandidat</span></div>", unsafe_allow_html=True)
+    if filtered.empty:
+        st.warning("Tidak ada data pada filter global saat ini.")
+    else:
+        e1, e2, e3 = st.columns([1.5, 1, 1])
+        sort_col = e1.selectbox(
+            "Urutkan berdasarkan",
+            ["quality_score", "value_score", "crowd_score", "display_score", "positivity", "review_volume", "year", "price_effective", "metacritic_score"],
+            format_func=lambda x: x.replace("_", " ").title(),
         )
+        sort_asc = e2.toggle("Ascending", value=False)
+        n_show = e3.slider("Jumlah kartu", 6, 60, 18, 3)
+        browse = filtered.sort_values(sort_col, ascending=sort_asc, na_position="last").head(n_show)
+        render_cards(browse, games, columns=3)
+        st.markdown("### Tabel data")
+        display_cols = [
+            "name",
+            "genre_primary",
+            "year",
+            "price_effective",
+            "is_free",
+            "positivity",
+            "review_volume",
+            "display_score",
+            "metacritic_score",
+            "playtime_h",
+            "developer",
+            "publisher",
+        ]
+        st.dataframe(
+            filtered[display_cols].rename(columns={"display_score": "quality_score", "price_effective": "price_usd"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download hasil filter CSV",
+            filtered.to_csv(index=False).encode("utf-8"),
+            file_name="steamvault_filtered_games.csv",
+            mime="text/csv",
+        )
+
+with tab_recommender:
+    st.markdown("<div class='section-title'><h3>Smart recommender</h3><span class='muted'>hybrid, explainable, configurable</span></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='mini-note'>Tips: pilih 1-5 game favorit atau beberapa tag/genre. Jika tidak ada input favorit, sistem otomatis menjadi cold-start recommender berbasis rule, value, dan crowd signal.</div>",
+        unsafe_allow_html=True,
+    )
+
+    MOODS = {
+        "Tanpa preset": [],
+        "Story rich & singleplayer": ["Story Rich", "Singleplayer", "RPG", "Adventure", "Atmospheric"],
+        "Competitive multiplayer": ["Multiplayer", "PvP", "Competitive", "Shooter", "eSports"],
+        "Cozy casual": ["Casual", "Relaxing", "Cozy", "Cute", "Family Friendly"],
+        "Strategy deep dive": ["Strategy", "Simulation", "Turn-Based", "Management", "Tactical"],
+        "Budget friendly": ["Free to Play", "Indie", "Casual", "Co-op"],
+    }
+
+    r1, r2 = st.columns([1.05, 0.95])
+    with r1:
+        engine = st.selectbox(
+            "Engine rekomendasi",
+            ["Smart Hybrid", "Content-Based", "Rule-Based", "Collaborative / Crowd"],
+            help="Smart Hybrid memakai weighted hybrid. Collaborative akan menjadi true user-item CF jika file interaksi diupload; jika tidak, memakai crowd wisdom proxy.",
+        )
+        favorite_titles = st.multiselect("Game favorit / referensi", all_titles, max_selections=5)
+        preferred_genres = st.multiselect("Genre preferensi", all_genres, max_selections=5)
+        preferred_tags = st.multiselect("Tag preferensi", all_tags, max_selections=10)
+        mood_name = st.selectbox("Mood preset", list(MOODS.keys()))
+        mood_terms = MOODS[mood_name]
+    with r2:
+        max_price = st.slider("Maksimum harga rekomendasi ($)", 0.0, float(math.ceil(price_limit_global)), min(45.0, float(math.ceil(price_limit_global))), 1.0)
+        min_pos = st.slider("Minimal positivity rekomendasi (%)", 0, 100, 65)
+        min_reviews = st.slider("Minimal review/recommendation", 0, 100000, 250, 250)
+        mode = st.selectbox("Mode bermain", ["any", "singleplayer", "multiplayer", "coop"])
+        must_have_tags = st.multiselect("Tag wajib", all_tags, max_selections=4)
+        top_n = st.slider("Jumlah rekomendasi", 5, 30, 12)
+        diversity = st.slider("Diversity penalty", 0.0, 0.60, 0.18, 0.02, help="Lebih tinggi = hasil lebih beragam, mengurangi game yang terlalu mirip satu sama lain.")
+
+    weights = {"content": 0.42, "crowd": 0.27, "rule": 0.16, "value": 0.10, "novelty": 0.05}
+    if engine == "Smart Hybrid":
+        with st.expander("Atur bobot hybrid", expanded=False):
+            w1, w2, w3, w4, w5 = st.columns(5)
+            weights["content"] = w1.slider("Content", 0.0, 1.0, weights["content"], 0.05)
+            weights["crowd"] = w2.slider("Crowd/CF", 0.0, 1.0, weights["crowd"], 0.05)
+            weights["rule"] = w3.slider("Rule", 0.0, 1.0, weights["rule"], 0.05)
+            weights["value"] = w4.slider("Value", 0.0, 1.0, weights["value"], 0.05)
+            weights["novelty"] = w5.slider("Novelty", 0.0, 1.0, weights["novelty"], 0.05)
+
+    recs = recommend_games(
+        games=games,
+        matrix=tfidf_matrix,
+        vectorizer=vectorizer,
+        engine=engine,
+        favorite_titles=favorite_titles,
+        preferred_genres=preferred_genres,
+        preferred_tags=preferred_tags,
+        must_have_tags=must_have_tags,
+        mood_terms=mood_terms,
+        max_price=max_price,
+        min_positivity=float(min_pos),
+        min_reviews=int(min_reviews),
+        mode=mode,
+        top_n=int(top_n),
+        diversity=float(diversity),
+        weights=weights,
+        interactions=interactions,
+    )
+
+    if recs.empty:
+        st.warning("Tidak ada rekomendasi yang cocok. Turunkan minimal positivity, review, harga, atau tag wajib.")
+    else:
+        source_label = recs["cf_source"].iloc[0] if "cf_source" in recs.columns else "Crowd proxy"
         st.markdown(
-            f"<div class='tag-filter-bar'>🏷️ <b>Filter tag aktif:</b> {chips_html}</div>",
+            f"<div class='mini-note'><b>Engine aktif:</b> {esc(engine)} | <b>Sinyal kolaboratif:</b> {esc(source_label)} | Hasil sudah direrank dengan diversity penalty.</div>",
             unsafe_allow_html=True,
         )
-        if st.button("✕ Hapus semua tag filter", key="clear_tags"):
-            st.session_state.active_tags = set()
-            st.rerun()
- 
-    # ── Metrics ───────────────────────────────────────────────────────────────
-    filt = get_filtered_data()  # re-evaluate after tag state may have changed
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Titles", f"{len(filt):,}")
-    c2.metric("Free Games", int(filt["is_free"].sum()))
-    c3.metric("Positivity ≥ 90%", int((filt["positivity"] >= 90).sum()))
-    meta_mean = filt["metacritic_score"].mean()
-    c4.metric("Avg Metacritic", f"{meta_mean:.0f}" if pd.notna(meta_mean) else "—")
- 
-    search  = st.text_input("🔍 Search game titles")
-    col_sort, col_n = st.columns([2, 1])
-    sort_by = col_sort.selectbox(
-        "Sort By",
-        ["score", "recommendations", "positivity", "avg_playtime_forever", "peak_ccu", "year", "metacritic_score"],
-    )
-    n_show = col_n.number_input("Show", 8, 2000, 24, step=8)
- 
-    browse = filt.copy()
-    if search:
-        browse = browse[browse["name"].str.contains(search, case=False, na=False)]
-    browse = browse.sort_values(sort_by, ascending=False, na_position="last").head(int(n_show))
- 
-    for _, row in browse.iterrows():
-        # Price tag
-        if row["is_free"]:
-            price_tag = "<span class='free-pill'>FREE</span>"
-        elif row.get("discount_pct", 0) > 0:
-            price_tag = (
-                f"<span class='discount-pill'>-{int(row['discount_pct'])}%</span>"
-                f" ${row['price_usd']:.2f}"
-            )
+        render_cards(recs, games, favorite_titles, preferred_tags, columns=3, show_components=True)
+
+        st.markdown("### Score breakdown")
+        chart_df = recs.head(10)[["name", "content_component", "crowd_component", "rule_component", "value_component", "novelty_component", "final_score"]].copy()
+        chart_long = chart_df.melt(id_vars="name", var_name="component", value_name="score")
+        fig = px.bar(chart_long, x="score", y="name", color="component", orientation="h", barmode="group", title="Komponen skor top recommendation", labels={"score": "Skor 0-1", "name": "Game"})
+        fig.update_yaxes(categoryorder="total ascending")
+        st.plotly_chart(clean_plotly(fig, height=470), use_container_width=True)
+
+        export_cols = [
+            "name",
+            "genre_primary",
+            "year",
+            "price_effective",
+            "positivity",
+            "review_volume",
+            "final_score_pct",
+            "content_component",
+            "crowd_component",
+            "rule_component",
+            "value_component",
+            "novelty_component",
+            "developer",
+            "publisher",
+            "short_description",
+        ]
+        st.download_button(
+            "Download rekomendasi CSV",
+            recs[export_cols].to_csv(index=False).encode("utf-8"),
+            file_name="steamvault_recommendations.csv",
+            mime="text/csv",
+        )
+
+with tab_evaluation:
+    st.markdown("<div class='section-title'><h3>Evaluasi rekomendasi</h3><span class='muted'>quality, diversity, coverage</span></div>", unsafe_allow_html=True)
+    st.write("Tab ini mengevaluasi hasil rekomendasi terakhir dari konfigurasi pada tab Rekomendasi.")
+    try:
+        eval_recs = recs.copy()
+    except NameError:
+        eval_recs = pd.DataFrame()
+
+    if eval_recs.empty:
+        st.info("Buat rekomendasi terlebih dahulu di tab Rekomendasi.")
+    else:
+        # Intra-list diversity from TF-IDF item vectors.
+        idxs = eval_recs.index.to_list()
+        if len(idxs) > 1:
+            sim = cosine_similarity(tfidf_matrix[idxs], tfidf_matrix[idxs])
+            tri = sim[np.triu_indices_from(sim, k=1)]
+            diversity_metric = 1 - float(np.mean(tri))
         else:
-            price_tag = f"${row['price_usd']:.2f}" if pd.notna(row["price_usd"]) else "—"
- 
-        # Thumbnail
-        img_html = ""
-        if row.get("header_image", ""):
-            img_html = f"<img src='{row['header_image']}' onerror=\"this.style.display='none'\">"
- 
-        steam_url = f"https://store.steampowered.com/app/{int(row['app_id'])}/"
- 
-        # Clickable tag chips — klik = filter by tag via query param workaround
-        tag_chips = ""
-        if row.get("tags"):
-            for t in [x.strip() for x in str(row["tags"]).split(",")][:10]:
-                active_cls = " active" if t in st.session_state.active_tags else ""
-                tag_chips += f"<span class='tag-chip{active_cls}' data-tag='{t}'>{t}</span>"
- 
+            diversity_metric = np.nan
+        genre_coverage = eval_recs["genre_primary"].nunique()
+        tag_counter = Counter()
+        for xs in eval_recs["tag_list"]:
+            if isinstance(xs, list):
+                tag_counter.update(xs)
+        tag_coverage = len(tag_counter)
+        avg_price = eval_recs["price_effective"].mean()
+        avg_pos = eval_recs["positivity"].mean()
+        avg_final = eval_recs["final_score_pct"].mean()
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Avg final score", fmt_float(avg_final, 1))
+        m2.metric("Avg positivity", fmt_float(avg_pos, 1, "%"))
+        m3.metric("Genre coverage", f"{genre_coverage}")
+        m4.metric("Tag coverage", f"{tag_coverage}")
+        m5.metric("Intra-list diversity", fmt_float(diversity_metric, 2))
+
+        e1, e2 = st.columns(2)
+        with e1:
+            genre_eval = eval_recs.groupby("genre_primary", as_index=False).size().sort_values("size", ascending=False)
+            fig = px.pie(genre_eval, values="size", names="genre_primary", title="Sebaran genre pada hasil rekomendasi")
+            st.plotly_chart(clean_plotly(fig, height=380), use_container_width=True)
+        with e2:
+            top_tag_eval = pd.DataFrame(tag_counter.most_common(12), columns=["tag", "count"])
+            if not top_tag_eval.empty:
+                fig = px.bar(top_tag_eval, x="count", y="tag", orientation="h", title="Top tag pada hasil rekomendasi")
+                fig.update_yaxes(categoryorder="total ascending")
+                st.plotly_chart(clean_plotly(fig, height=380), use_container_width=True)
+
+        st.markdown("### Interpretasi evaluasi")
         st.markdown(
             f"""
-            <div class='game-card'>
-                <a href='{steam_url}' target='_blank' style='display:contents'>
-                    {img_html}
-                </a>
-                <div class='game-card-body'>
-                    <span class='score-pill'>Score {row.get('score', 0):.1f}</span>
-                    <a href='{steam_url}' target='_blank'
-                       style='text-decoration:none;color:inherit'>
-                        <h4 style='margin:0 0 4px;display:inline'>{row['name']}</h4>
-                        <span style='font-size:12px;color:#4a9eff;margin-left:6px'>↗ Steam</span>
-                    </a>
-                    <p style='margin:2px 0;color:#94a3b8;font-size:13px'>
-                        {row.get('genre_primary', '')} ·
-                        {int(row['year']) if pd.notna(row['year']) else '—'} ·
-                        {price_tag}
-                    </p>
-                    <p style='margin:2px 0;font-size:13px'>
-                        👍 {row.get('positivity', 0):.1f}%&nbsp;|&nbsp;
-                        👥 {int(row.get('recommendations', 0)):,} recs&nbsp;|&nbsp;
-                        🕐 {row.get('avg_playtime_forever', 0)/60:.0f}h avg
-                    </p>
-                    <div style='margin-top:6px'>{tag_chips}</div>
-                </div>
+            - **Final score rata-rata** menunjukkan kekuatan rekomendasi berdasarkan engine yang dipilih.
+            - **Intra-list diversity** mendekati 1 berarti rekomendasi lebih bervariasi; mendekati 0 berarti hasil sangat mirip satu sama lain.
+            - **Genre/tag coverage** membantu melihat apakah sistem terlalu sempit atau sudah cukup beragam.
+            - **Harga rata-rata** saat ini sekitar **${avg_price:.2f}**, sehingga bisa dipakai untuk membahas aspek value-for-money.
+            """
+        )
+
+with tab_method:
+    st.markdown("<div class='section-title'><h3>Metodologi sistem rekomendasi</h3><span class='muted'>siap dipakai untuk pembahasan dashboard</span></div>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        Dashboard ini memakai empat pendekatan utama agar sesuai dengan topik recommendation system.
+        """
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(
+            """
+            <div class='method-card'>
+            <h4>1. Rule-Based Recommendation</h4>
+            <p>Rekomendasi dipilih menggunakan aturan eksplisit seperti genre, harga, minimal positivity, minimal review, mode bermain, dan tag wajib.</p>
+            <p><b>Kelebihan:</b> mudah dijelaskan dan cocok untuk cold-start user.</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
- 
-        # Tag filter buttons — satu per tag, tersembunyi rapi di expander
-        if row.get("tags"):
-            row_tags = [x.strip() for x in str(row["tags"]).split(",")][:10]
-            with st.expander("🏷️ Filter by tag", expanded=False):
-                cols = st.columns(5)
-                for i, t in enumerate(row_tags):
-                    is_active = t in st.session_state.active_tags
-                    label = f"✓ {t}" if is_active else t
-                    if cols[i % 5].button(label, key=f"tag_{row['app_id']}_{t}"):
-                        if is_active:
-                            st.session_state.active_tags.discard(t)
-                        else:
-                            st.session_state.active_tags.add(t)
-                        st.rerun()
- 
- 
-# ── DETAIL ────────────────────────────────────────────────────────────────────
-with tab_detail:
-    selected_game = st.selectbox("Select Game", all_titles)
- 
-    if selected_game:
-        g = games[games["name"] == selected_game].iloc[0]
- 
-        col_img, col_info = st.columns([1, 2])
-        with col_img:
-            if g.get("header_image", ""):
-                st.image(g["header_image"], use_container_width=True)
- 
-        with col_info:
-            steam_url = f"https://store.steampowered.com/app/{int(g['app_id'])}/"
-            st.subheader(g["name"])
-            st.markdown(f"[🔗 Buka di Steam Store]({steam_url})", unsafe_allow_html=False)
-            desc = g.get("short_description", "")
-            if desc:
-                st.write(desc)
- 
-            col1, col2, col3, col4 = st.columns(4)
-            pos = g.get("positivity")
-            col1.metric("Positivity", f"{pos:.1f}%" if pd.notna(pos) else "—")
-            col2.metric("Recommendations", f"{int(g.get('recommendations', 0)):,}")
-            meta = g.get("metacritic_score")
-            col3.metric("Metacritic", f"{int(meta)}" if pd.notna(meta) else "—")
-            pt = g.get("avg_playtime_forever", 0)
-            col4.metric("Avg Playtime", f"{pt/60:.1f} h" if pt else "—")
- 
-            price_display = "Free" if g["is_free"] else f"${g.get('price_usd', 0):.2f}"
-            st.caption(
-                f"**Developer:** {g.get('developer','—')} &nbsp;|&nbsp; "
-                f"**Publisher:** {g.get('publisher','—')} &nbsp;|&nbsp; "
-                f"**Price:** {price_display}"
-            )
-            if g.get("tags"):
-                tags = g["tags"].split(",")[:8]
-                st.write(" ".join(f"`{t.strip()}`" for t in tags))
- 
-        st.markdown("### 🎮 Similar Games")
-        sim = rec_cb(games, selected_game, 8)
-        if not sim.empty:
-            sim["steam_url"] = sim["app_id"].apply(
-                lambda x: f"https://store.steampowered.com/app/{int(x)}/"
-            )
-            st.dataframe(
-                sim[["name", "genre_primary", "cb_score", "score", "positivity", "steam_url"]].rename(
-                    columns={
-                        "name": "Game",
-                        "genre_primary": "Genre",
-                        "cb_score": "Similarity",
-                        "score": "Score",
-                        "positivity": "Positivity %",
-                        "steam_url": "Steam",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-                column_config={"Steam": st.column_config.LinkColumn("Steam", display_text="↗ Buka")},
-            )
- 
- 
-# ── RECOMMEND ────────────────────────────────────────────────────────────────
-# Nama algoritma yang lebih keren
-ALGO_NAMES = {
-    "🎯 Precision Filter": "rule",
-    "🧬 DNA Match  (TF-IDF)": "cb",
-    "🔥 Crowd Wisdom": "cf",
-    "⚡ Neural Blend": "hybrid",
-}
- 
-with tab_recommend:
-    method_label = st.selectbox("Engine", list(ALGO_NAMES.keys()))
-    method = ALGO_NAMES[method_label]
- 
-    # Deskripsi singkat tiap algoritma
-    algo_desc = {
-        "rule":   "Filter presisi berdasarkan genre, harga, dan mode bermain. Cocok kalau kamu udah tau mau apa.",
-        "cb":     "Cari game yang DNA-nya mirip — genre, tags, dan developer yang sama. Makin banyak yang cocok, makin tinggi skornya.",
-        "cf":     "Lihat apa yang disukai komunitas. Game yang direkomendasikan banyak orang dengan sentimen positif tinggi akan muncul duluan.",
-        "hybrid": "Gabungin DNA Match + Crowd Wisdom. Bisa atur berapa persen bobot masing-masing sesuai selera.",
-    }
-    st.caption(algo_desc[method])
-    st.divider()
- 
-    recs = pd.DataFrame()
- 
-    if method == "rule":
-        genres   = st.multiselect("Genres", all_genres)
-        max_price = st.slider("Max Price ($)", 0, 150, 30)
-        min_pos2  = st.slider("Min Positivity (%)", 0, 100, 70)
-        min_recs  = st.slider("Min Recommendations", 0, 100_000, 5_000, step=1_000)
-        mode      = st.selectbox("Mode", ["any", "singleplayer", "multiplayer", "coop"])
-        top_n     = st.number_input("Top N", 5, 30, 10)
- 
-        if st.button("🚀 Find Games"):
-            recs = rec_rule(games, genres, max_price, min_pos2, min_recs, mode, int(top_n))
- 
-    elif method == "cb":
-        ref   = st.selectbox("Reference Game", all_titles, key="cb")
-        top_n = st.number_input("Top N", 5, 30, 10, key="cbn")
- 
-        if st.button("🚀 Find Games"):
-            recs = rec_cb(games, ref, int(top_n))
- 
-    elif method == "cf":
-        genres   = st.multiselect("Genres", all_genres, key="cf")
-        min_pos2  = st.slider("Min Positivity (%)", 0, 100, 75, key="cfp")
-        top_n     = st.number_input("Top N", 5, 30, 10, key="cfn")
- 
-        if st.button("🚀 Find Games"):
-            recs = rec_cf(games, genres, min_pos2, int(top_n))
- 
-    else:  # hybrid
-        ref   = st.selectbox("Reference Game", all_titles, key="hy")
-        cb_w  = st.slider("DNA Match Weight", 0.0, 1.0, 0.6, 0.05,
-                          help="0 = murni Crowd Wisdom, 1 = murni DNA Match")
-        top_n = st.number_input("Top N", 5, 30, 10, key="hyn")
- 
-        if st.button("🚀 Find Games"):
-            recs = rec_hybrid(games, ref, int(top_n), cb_w)
- 
-    if not recs.empty:
-        show_cols = [c for c in ["name", "genre_primary", "score", "positivity",
-                                  "recommendations", "cb_score", "wr", "hybrid_score"]
-                     if c in recs.columns]
-        recs["steam_url"] = recs["app_id"].apply(
-            lambda x: f"https://store.steampowered.com/app/{int(x)}/"
+        st.markdown(
+            """
+            <div class='method-card'>
+            <h4>2. Content-Based Recommendation</h4>
+            <p>Item profile dibangun dari genre, tag, kategori, developer, publisher, dan deskripsi singkat. Teks dikonversi menjadi TF-IDF, lalu dihitung kemiripannya dengan cosine similarity.</p>
+            <p><b>Formula:</b> similarity(user, item) = cosine(TF-IDF user profile, TF-IDF item profile).</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.dataframe(
-            recs[show_cols + ["steam_url"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={"steam_url": st.column_config.LinkColumn("Steam", display_text="↗ Buka")},
+    with c2:
+        st.markdown(
+            """
+            <div class='method-card'>
+            <h4>3. Collaborative / Crowd Signal</h4>
+            <p>Jika file interaksi user-item diupload, sistem memakai item-based collaborative filtering. Jika tidak, dashboard memakai proxy crowd wisdom dari Bayesian rating, volume review, dan popularity.</p>
+            <p><b>Catatan ilmiah:</b> proxy crowd wisdom bukan pure CF, tetapi aman untuk dataset agregat yang tidak punya user_id.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
- 
- 
-# ── ANALYTICS ─────────────────────────────────────────────────────────────────
-with tab_analytics:
-    if filt.empty:
-        st.warning("Tidak ada data yang cocok dengan filter saat ini.")
-    else:
-        c1, c2 = st.columns(2)
- 
-        with c1:
-            genre_count = (
-                filt[filt["genre_primary"] != ""]
-                .groupby("genre_primary").size()
-                .sort_values(ascending=False)
-                .head(12)
-                .reset_index(name="n")
-            )
-            fig = px.bar(
-                genre_count, x="n", y="genre_primary", orientation="h",
-                title="Top 12 Genres", labels={"n": "Jumlah Game", "genre_primary": "Genre"},
-                color="n", color_continuous_scale="Blues",
-            )
-            fig.update_layout(showlegend=False, coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
- 
-        with c2:
-            price_data = filt[filt["price_usd"] > 0]
-            fig = px.histogram(
-                price_data, x="price_usd", nbins=20,
-                title="Distribusi Harga (exclude free)",
-                labels={"price_usd": "Harga ($)", "count": "Jumlah"},
-            )
-            st.plotly_chart(fig, use_container_width=True)
- 
-        # FIX: filter outlier playtime supaya scatter tidak rusak
-        scatter_data = filt[
-            filt["avg_playtime_forever"].notna() &
-            (filt["avg_playtime_forever"] > 0) &
-            (filt["avg_playtime_forever"] < filt["avg_playtime_forever"].quantile(0.99))
-        ].copy()
-        scatter_data["playtime_h"] = scatter_data["avg_playtime_forever"] / 60
- 
-        fig = px.scatter(
-            scatter_data,
-            x="playtime_h", y="score",
-            color="positivity",
-            hover_name="name",
-            hover_data={"playtime_h": ":.1f", "score": ":.1f", "positivity": ":.1f"},
-            title="Playtime vs Score (warna = positivity)",
-            labels={"playtime_h": "Avg Playtime (jam)", "score": "Score", "positivity": "Positivity %"},
-            color_continuous_scale="RdYlGn",
+        st.markdown(
+            """
+            <div class='method-card'>
+            <h4>4. Weighted Hybrid Recommendation</h4>
+            <p>Skor akhir menggabungkan content match, crowd/collaborative signal, rule fit, value, dan novelty.</p>
+            <p><b>Formula:</b> S = w1*C_content + w2*C_crowd + w3*C_rule + w4*C_value + w5*C_novelty.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.plotly_chart(fig, use_container_width=True)
- 
-        # Tabel lengkap
-        st.markdown("### 📋 Data Lengkap")
-        display_cols = [
-            "name", "genre_primary", "year", "price_usd", "is_free",
-            "positivity", "recommendations", "score", "metacritic_score",
-            "avg_playtime_forever", "peak_ccu",
-        ]
-        st.dataframe(filt[display_cols], use_container_width=True, hide_index=True)
- 
-        csv_bytes = filt.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇ Export CSV",
-            data=csv_bytes,
-            file_name="steamvault_export.csv",
-            mime="text/csv",
-        )
+
+    st.markdown("### Rumus penting")
+    st.latex(r"WR = \frac{v}{v+m}R + \frac{m}{v+m}C")
+    st.markdown(
+        """
+        Keterangan: `R` adalah positivity item, `v` adalah jumlah review/recommendation, `C` adalah rata-rata positivity seluruh item, dan `m` adalah ambang minimum berbasis kuantil. Rumus ini membuat game dengan review sedikit tidak langsung menang hanya karena positivity tinggi.
+        """
+    )
+    st.markdown("### Keterbatasan")
+    st.markdown(
+        """
+        - Dataset Steam top games biasanya bersifat agregat, sehingga tidak selalu memiliki matriks `user_id x item`. Karena itu, true collaborative filtering hanya aktif jika file interaksi user-item ditambahkan.
+        - Content-based recommendation sangat bergantung pada kualitas metadata seperti tag, genre, dan deskripsi.
+        - Hybrid recommendation lebih robust, tetapi bobotnya perlu divalidasi dengan data interaksi nyata atau A/B testing jika digunakan di lingkungan produksi.
+        """
+    )
